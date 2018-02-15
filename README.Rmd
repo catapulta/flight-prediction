@@ -1,0 +1,1130 @@
+---
+title: "Flight Delay Prediction at the Pittsburgh Airport"
+author: "Aldo Marini, Ellie Najewicz, Nidhi Shree, Xin Qiu"
+output: 
+  html_document:
+    keep_md: true
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    theme: "spacelab"
+    code_folding: hide
+    
+---
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(cache=TRUE)
+  fig.path = "README_figs/README-"
+```
+
+Introduction:
+
+We build a model to predict if a flight is going to be on time, moderately delayed, or severly delayed. Flight delays impact people's travel plans. Be it a complete re-scheduling of the travel plans, or just waking up some minutes later, we think our customers could use the flight delay information for good. Further, anecdotical experience tells us that airlines are not good in predicting flight delays-or at least not good in communicating it to their customers. So, we aim to provide people, our customers, of actionable flight delay information.
+
+In order to achieve this result, we first explore descriptive trends, then run a variable selection process to select the smallest number of variables with the lowest error rate, and finally choose a model based on customer preferences. We find that a Random Forest performs impressively well-with an accuracy of 99%. Last, to confirm the external validity of our model, we run it on data from 2006. While many things have changed since 2006, we confirm that the model is robust in time. 
+
+Key Tasks: 
+
+This sample was retrieved from the source and run through cleaning. A sample of this data is shown at the end of the Data Overview section
+
+A discussion of which variables are most useful can be seen at the beginning of our Discussion section. An exploration of each variables are completed in the Descriptive Analysis. 
+
+A discussion of a delay predicting application is located in our Discussion section at the bottom of the report. 
+
+A comparison of our model run on the 2006 data is in the External Validity section. 
+
+
+
+##Obtaining 2017-16 Data
+
+```{r cache=FALSE, message=FALSE}
+library(ggplot2)
+library(ISLR)
+library(MASS)
+library(knitr)
+library(glmnet)
+library(plyr)
+library(gam) 
+library(dplyr)
+library(curl)
+library(utils)
+library(stringr)
+library(lubridate)
+library(data.table)
+library(randomForest)
+library(gbm)
+library(caret)
+library(glmnet)
+library(MASS)
+library(klaR)
+library(ROCR)
+
+working_directory = "C:/Users/ald0m/Desktop/flight-prediction/"
+
+#import 2016 data
+all.flights <- read.csv(paste0(working_directory,"data/","flights.csv"))
+
+carrier <- read.csv(paste0(working_directory,"data/","carrier_list.csv"))
+colnames(carrier)[colnames(carrier)=="Description"] <- "AIRLINE_DESC"
+delay.group <- read.csv(paste0(working_directory,"data/","delay_groups.csv"))
+colnames(delay.group)[colnames(delay.group)=="Description"] <- "DEP_DELAY_GROUP"
+distance.group <- read.csv(paste0(working_directory,"data/","L_DISTANCE_GROUP_250.csv"))
+colnames(distance.group)[colnames(distance.group)=="Description"] <- "DISTANCE_GROUP"
+weekdays <- read.csv(paste0(working_directory,"data/","L_WEEKDAYS.csv"))
+
+#import 2006 data
+all.PIT.2006 <- read.csv(paste0(working_directory,"data/","all_PIT_2006.csv"))
+
+#import weather data
+weather.2006 <- read.csv(paste0(working_directory,"data/","Pittsburgh_Data_2006.csv"))
+weather.2016.17 <- read.csv(paste0(working_directory,"data/","Pittsburgh_Data_2016-17.csv"))
+
+#import holiday data
+hols.2016 <- read.csv(paste0(working_directory,"data/","holidays.2016.17.csv"))
+hols.2006 <- read.csv(paste0(working_directory,"data/","holidays.2006.csv"))
+```
+
+```{r}
+#preparing the holiday table
+hols.2016$date <- as.Date(hols.2016$date, format = "%Y-%m-%d")
+hols.2006$date <- strptime(as.character(hols.2006$date), "%d-%m-%Y")
+hols.2006$date <- as.Date(as.character(hols.2006$date), format = "%Y-%m-%d")
+```
+
+```{r}
+#preparing the weather table
+weather.2016.17$DATE <- as.Date(weather.2016.17$DATE, format = "%d-%m-%Y")
+weather.2006$DATE <- as.Date(weather.2006$DATE, format = "%d-%m-%Y")
+```
+
+##Cleaning the 2016 Data
+After building the data set, we had to clean the data set. This included common tasks such as putting dates and timestamps in proper format, changing group numbers to a description, and adding external data such as weather and holiday data. We also worked on reducing the rows to only those we need for our analysis and selecting only flights with either PIT as the origin airport or the destination airport. We then made a merge to capture the arrival flight information with the destination flight information. So now we have just a table of flight departures from PIT with their associated arrival flight information. This was an important effort since we wanted to know if the arrival flight was delayed since that would have a crucial impact on whether a flight takes off on time. See below a sample of our final data set: 
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+flights <- select(all.flights,- FLIGHTS)
+colnames(flights)[colnames(flights)=="Description"] <- "AIRLINE_DESC"
+flights$AIRLINE_DESC <- as.factor(flights$AIRLINE_DESC)
+
+flights$FL_DATE <- as.Date(flights$FL_DATE)
+
+flights$is.delay <- ifelse(flights$DEP_DELAY>0,1,0)
+
+flights <- left_join(flights , weekdays, by = c("DAY_OF_WEEK"= "Code")) 
+flights <- left_join(flights , delay.group, by = c("DEP_DELAY_GROUP"= "Code")) 
+
+flights <- select (flights,-DAY_OF_WEEK,-DEP_DELAY_GROUP)
+
+#merging the 2016-17 holiday data with 2016-17 flights data
+flights <- left_join(flights, hols.2016, by = c("FL_DATE"="date"))
+names(flights)[67] <- "IS_HOLIDAY"
+flights$IS_HOLIDAY <- ifelse(is.na(flights$IS_HOLIDAY),0,1)
+
+#merging the 2016-17 weather data with 2016-17 flights data
+flights <- left_join(flights, weather.2016.17, by = c("FL_DATE"="DATE"))
+flights <- select(flights, -NAME)
+```
+
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+#to study the columns (variables) of 2016 and 2006 data
+col.flights <- names(flights)
+col.2016 <- sort(col.flights, decreasing = FALSE)
+
+col.flights.2006 <- names(all.PIT.2006)
+ext.cols <- rep("NA", (length(col.2016)-length(col.flights.2006)))
+cols.2006 <- c(col.flights.2006,ext.cols)
+col.2006 <- sort(cols.2006, decreasing = FALSE, na.last = NA)
+
+fl.cols <- data.frame(col.2016,col.2006)
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+#preparing the arrivals table
+arr.flights <- filter(flights,flights$DEST_CITY_NAME == "Pittsburgh, PA" & flights$DEST == "PIT")
+arr.flights <- select(arr.flights,ORIGIN_AIRPORT_ID, ORIGIN_STATE_ABR,TAIL_NUM,FL_DATE,ARR_DELAY,ARR_TIME,DISTANCE, DISTANCE_GROUP,DIVERTED,AIRLINE_DESC,ACTUAL_ELAPSED_TIME)
+arr.flights$IF_DELAY <- ifelse(arr.flights$ARR_DELAY>15, 1,0)
+
+#preparing the departure flights table
+dep.flights <- filter(flights,flights$ORIGIN_CITY_NAME == "Pittsburgh, PA" & flights$ORIGIN == "PIT")
+dep.flights <- select(dep.flights,DEST_AIRPORT_ID, DEST_STATE_ABR,TAIL_NUM,MONTH,FL_DATE,DEP_DELAY,DEP_TIME,DISTANCE, DISTANCE_GROUP,DIVERTED,AWND,PRCP,TMAX,TMIN,IS_HOLIDAY,AIRLINE_DESC,QUARTER, AIRLINE_ID,DEST_CITY_NAME,CANCELLED)
+dep.flights$IF_DELAY <- ifelse(dep.flights$DEP_DELAY>15, 1,0)
+
+#working with arrivals time
+arr.flights$ARR_TIME <- as.character(arr.flights$ARR_TIME)
+arr.flights$ARR_TIME <- str_pad(arr.flights$ARR_TIME, width = 4, side = "left", pad = "0")
+arr.flights$ARR_TIME_STAMP <- paste(substr(arr.flights$ARR_TIME, start = 1, stop = 2),  substr(arr.flights$ARR_TIME, start = 3, stop = 4), sep=":")
+arr.flights$ARR_TIME_STAMP <- paste(arr.flights$ARR_TIME_STAMP, "00", sep=":")
+arr.flights$DATE_TIME <- paste (arr.flights$FL_DATE, arr.flights$ARR_TIME_STAMP, sep=" ")
+arr.flights$DATE_TIME <- ymd_hms(arr.flights$DATE_TIME,tz=Sys.timezone())
+
+#working with departure time
+dep.flights$DEP_TIME <- as.character(dep.flights$DEP_TIME)
+dep.flights$DEP_TIME <- str_pad(dep.flights$DEP_TIME, width = 4, side = "left", pad = "0")
+dep.flights$DEP_TIME_STAMP <- paste(substr(dep.flights$DEP_TIME, start = 1, stop = 2),  substr(dep.flights$DEP_TIME, start = 3, stop = 4), sep=":")
+dep.flights$DEP_TIME_STAMP <- paste(dep.flights$DEP_TIME_STAMP, "00", sep=":")
+dep.flights$DATE_TIME <- paste(dep.flights$FL_DATE, dep.flights$DEP_TIME_STAMP, sep=" ")
+dep.flights$DATE_TIME <- ymd_hms(dep.flights$DATE_TIME,tz=Sys.timezone())
+
+#matching each departure flights with arrivals flights
+match.flights <- right_join(arr.flights, dep.flights, by = c ("TAIL_NUM", "FL_DATE"))
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+    #if same arrival and departure date are same
+      fl.count.1 <- nrow(inner_join(arr.flights, dep.flights, by = c ("TAIL_NUM", "FL_DATE")))
+    #if flight and departure date are not same
+      #first join all the same planes
+      fl.joint <- inner_join(arr.flights, dep.flights, by = c ("TAIL_NUM"))
+      #remove the planes flying on the same date (as we have already covered that)
+      fl.joint <- filter(fl.joint, fl.joint$FL_DATE.x!=fl.joint$FL_DATE.y)
+      #calculate the difference in departure and arrival date times
+      fl.joint$transit.time <- difftime(fl.joint$DATE_TIME.y,fl.joint$DATE_TIME.x,unit="hours")
+      #round the difference in hours
+      fl.joint$transit.time <- round(fl.joint$transit.time)
+      #get those flights whose transit time is within 12 hours
+      fl.joint$FL_DATE = fl.joint$FL_DATE.y # not the cleanest way
+      fl.joint <- filter(fl.joint,fl.joint$transit.time<12 & fl.joint$transit.time>0)
+      fl.count.2 <- nrow(unique(fl.joint))
+      # create analysis dataframe
+      x = rbindlist(list(as.data.table(right_join(arr.flights, dep.flights, by = c ("TAIL_NUM", "FL_DATE"))), as.data.table(fl.joint)), fill=TRUE)
+```
+
+```{r}
+kable(head(x))
+```
+
+In our sample we have `r nrow(dep.flights)` total flights in our data set. Our data ranges from `r min(dep.flights$FL_DATE)` to `r max(dep.flights$FL_DATE)`. 
+
+##Descriptive Analysis
+
+This report looks to predict if a flight will be delayed and if so, to what extent. Thus, it is important to first look at descriptive statistics on the flight delays themselves to guide our hypothesis.Approximately `r (nrow(subset(dep.flights,DEP_DELAY>0))/nrow(dep.flights))*100`% of these flights were delayed by any amount.
+
+###Flight Delays
+First, we will look at the distribution of delays:
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(subset(fl.joint, DEP_DELAY < 550), aes(DEP_DELAY)) + geom_density(fill = "Dark blue", alpha = 0.6) +  geom_vline(data=all.flights, xintercept = 15, color = "black") + geom_text(aes(x=25, label="Delay more than 15 minutes"),y=0.06, colour="black", angle=90, text=element_text(size=8)) + xlab("Flight Delay Time (in minutes)") + ylab("Density") + labs(title="Distribution of Delay Times")
+```  
+From the density plot we can see that most delays are small delays under 15 minutes late. However, delays have a large variation and can range to over 500 minutes. Note that some of the delays are actually negative - this indicates that a flight actually left early. This shows us that a majority of flights leave a few minutes early or right on time. To better understand the severity of delays we can look at the proportion of delays that are group based on the severity of their delay time.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE} 
+
+delay.group.plot <- all.flights %>%
+  filter(DEP_DELAY>0)%>%
+  group_by(DEP_DELAY_GROUP)%>%
+  tally()
+
+delay.group.plot <- merge(delay.group.plot,delay.group, by.x = "DEP_DELAY_GROUP", by.y = "Code")
+
+pie(delay.group.plot$n, labels = delay.group.plot$AIRLINE_DESC, main="Flight Delay Breakdown", cex=0.5)
+```
+
+This pie chart sheds more light on the distribution of delay times in our data. This confirms that of all flights that are delayed, about 50% of them are under 15 minutes. Then about 25% of the data is between 15 and 45 minutes. Lastly, the final 25% includes delays of 45 minutes or greater. 
+
+We know that flights are delayed for various reasons. The data contains variables that capture the minutes of delay associated with a particular delay reason. The proportion of each delay type that accounts for flight delays in Pittsburgh are shown below: 
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+dep.flights$is.delayed <- ifelse(dep.flights$DEP_DELAY>0,1,0)
+all.flights$is.delayed <- ifelse(all.flights$DEP_DELAY>0,1,0)
+mean.delay <-mean(subset(all.flights,!is.na(WEATHER_DELAY))$DEP_DELAY)
+
+delay.reasons <- all.flights %>%
+  filter(DEP_DELAY>0 & !is.na(NAS_DELAY))%>%
+  summarize(carrier = mean(CARRIER_DELAY), weather = mean(WEATHER_DELAY), air.traffic = mean(NAS_DELAY), security = mean(SECURITY_DELAY), late.aricraft = mean(LATE_AIRCRAFT_DELAY))
+
+delay.reasons <- melt(delay.reasons)
+
+delay.reasons$value <- delay.reasons$value/mean.delay
+
+ggplot(delay.reasons,aes(as.factor(variable),as.double(value), fill = variable)) + geom_bar(stat = "identity") + ylab("Proportion of delay time") + xlab("reasons for delay")  + scale_fill_discrete(guide = FALSE) + labs(title="Proportion of delay time accounted for each delay type")
+``` 
+
+From this bar chart we can estimate that on average a flight's delay time is mostly due to a late aircraft or a carrier-caused delay. Air traffic seems to also make up a large proportion of delays. Whereas weather and security rarely account for delayed flights. Variables that have to do with the carrier, arrival information, and air traffic will be a good predictors of delay time. Since weather is so low as a cause for delay, we might expect seasonality not to be a good predictor of delays.
+
+Even though we will not explicitly use these data attributes later on in the modelling. We will find out that by using proxies for aircraft delays, carriers and weather as predictors, we can get a useful accuracy in predicting delays.
+
+Now we have a good understanding of delays at the Pittsburgh airport, we can begin to look at some of the other variables and their relationship with flight delays.
+
+###Seasonality and delays
+
+Addressing seasonality, we will look at delays broken down by quarters. Below see a scatter plot that shows a scatter plot of quarter and length of delays. We also tried plotting the months, and there were no visible trends.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+proportion.delay <- dep.flights %>%
+  filter(!is.na(IF_DELAY)) %>%
+  group_by(QUARTER,IF_DELAY) %>%
+  tally()
+
+ggplot(proportion.delay, aes(QUARTER, n ,fill = as.factor(IF_DELAY))) + geom_bar(stat="identity") + scale_fill_discrete(name="Delays", labels=c("Not Delayed","Delayed"))+ ylab("Count") + xlab("Quarter") + labs(title="Number of Flights per Quarter")
+
+```
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+
+ggplot(subset(dep.flights,DEP_DELAY > 15 & DEP_DELAY < 550),aes(QUARTER,DEP_DELAY, color = as.factor(QUARTER))) + geom_point(alpha = 0.3) + geom_jitter() + geom_smooth(method = "lm", formula = y ~ cut(x, breaks = c(-Inf,1,2,3,4,5,6,7,8,9,10,11,12, Inf)), lwd = 1.25, color = "white") + xlab("Quarter") + ylab("Flight Delay Time (in minutes)") + labs(title="Scatter plot of Severe Delay times and Quarter") + scale_color_discrete(name="Quarter", labels=c("Winter","Spring", "Summer", "Fall"))
+```
+
+There does not not appear to be any major trends identified when looking at seasonal trends. Delays seem to increase in frequency and severity during the spring and the holidays. This could be because of increased air traffic or weather. 
+
+###Airline Carriers and Delays
+
+Now we can try to identify if there are significant differences in delays for different airline carriers. The following plot presents all airlines in our sample. 
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+carrier.group <- dep.flights %>%
+  filter(DEP_DELAY>0)%>%
+  group_by(AIRLINE_DESC)%>%
+  summarize(delay.mean = mean(DEP_DELAY), sd.delay = sd(DEP_DELAY), count = n())%>%
+  arrange(desc(delay.mean))
+
+pie(carrier.group$count, labels = carrier.group$AIRLINE_DESC, main="Airline Breakdown", cex=0.7)
+
+kable(carrier.group[,c(1,2,3)], col.names = c("Airline", "Mean Delay Time","Standard Deviation Delay Time"))
+```
+
+It seams that southwest is the most popular airline at the PIT airport, along with lots of flights from American Airlines and Delta. Also the most delayed flights tend to be from Express Jet, SkyWest, and Spirit Air. This trend could be because of smaller samples.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+carrier.group <- dep.flights %>%
+  filter(!is.na(IF_DELAY))%>%
+  group_by(AIRLINE_DESC, IF_DELAY)%>%
+  tally()
+
+ggplot(carrier.group, aes(AIRLINE_DESC, n ,fill = as.factor(IF_DELAY))) + geom_bar(stat="identity") + scale_fill_discrete(name="Delays", labels=c("Not Delayed","Delayed"))+ ylab("Count") + xlab("Airlines") + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + labs(title="Number of Flights per Airline")
+```
+
+The bar graph above shows how many delayed flights are accounted for in each airline. South West has a very high proportion of delayed flights as does Express airlines, Frontier, and JetBlue. From this analysis, the type of airline might have an effect on if a flight is delayed. 
+
+###Destination and Delay times
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+states <- read.csv(paste0(working_directory,"data/","50_us_states_all_data.csv"),header=F)
+
+state.group <- fl.joint%>%
+  filter(DEP_DELAY>0)%>%
+  group_by(DEST_STATE_ABR)%>%
+  summarize(delay.mean = mean(DEP_DELAY), sd.delay = sd(DEP_DELAY), count = n())%>%
+  arrange(desc(delay.mean))
+
+states$V3<- toupper(states$V3)
+state.group<-  merge(x =states, y = state.group, by.x = "V3",by.y = "DEST_STATE_ABR", all.x = TRUE)
+state.group$count[is.na(state.group$count)] <- 0 
+state.group <- state.group %>% arrange(desc(delay.mean))
+```
+
+```{r eval=F}
+library(fiftystater)
+#code from https://cran.r-project.org/web/packages/fiftystater/vignettes/fiftystater.html 
+ggplot(state.group, aes(map_id = tolower(V1))) + 
+  # map points to the fifty_states shape data
+  geom_map(aes(fill = count), map = fifty_states) + 
+  expand_limits(x = fifty_states$long, y = fifty_states$lat) +
+  coord_map() +
+  scale_x_continuous(breaks = NULL) + 
+  scale_y_continuous(breaks = NULL) +
+  labs(x = "", y = "") +
+  theme(legend.position = "bottom") + scale_fill_gradient(low="blue", high="red")
+
+kable(subset(state.group[,c(1,5,6)], !is.na(state.group$delay.mean)),row.names = FALSE ,col.names = c("State", "Mean Delay Time","Standard Deviation Delay Time"))
+```
+
+From this we can see that most flights are going to Georgia, Florida, and Illinois. The states with the most delayed flights come from New York, Pennsylvanian, and North Carolina. The variance of delay times by state are very large. It is uncertain if destination state will be an influential factor in our model. Note: the Standard deviation for Missouri is NA because there is only one flight in our sample.  
+
+We can do this same analysis for cities and see if we get similar results:
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+city.group <- dep.flights %>%
+  filter(!is.na(IF_DELAY), DEP_DELAY>0)%>%
+  group_by(DEST_STATE_ABR,DEST_CITY_NAME)%>%
+  summarize(delay.mean = mean(DEP_DELAY), sd.delay = sd(DEP_DELAY), count = n())%>%
+  arrange(DEST_STATE_ABR)
+
+kable(city.group[,c(2,4,5)],col.names = c("City", "Mean Delay Time","Standard Deviation Delay Time"))
+```
+
+When we looking at cities we see similar trends. New York City, Philadelphia, and Minneapolis tend to have the worst delays. Overall, we do not see striking trends in the data regarding destination city, it seems that state may be a better variable to include in our model than city. 
+
+###A Note on Cancelations
+
+While Cancellations are not what we are measuring in this analysis, we wanted to briefly investigate if delayed flights eventually become canceled or if there is little overlap with these events. We found that of all delayed flights only `r nrow(subset(dep.flights, DEP_DELAY >0 & CANCELLED == 1))` flights were canceled or `r (nrow(subset(dep.flights, DEP_DELAY >0 & CANCELLED == 1))/nrow(subset(flights, DEP_DELAY >0)))*100`% of delays are cancelled. Since there appears to be very litter overlap between these events, cancellations will not be part of our analysis. 
+
+###Distance of flight and delays
+
+We would like to investigate if the distance of the flight has any relationship with the possibility and severity of delays. First, looking at the distribution of flight distances:
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(subset(dep.flights,DEP_DELAY>0 & DEP_DELAY<550),aes(DISTANCE,DEP_DELAY, color = DEP_DELAY)) + geom_jitter(width = 50) + geom_point(alpha = 0.3) + scale_color_gradient(low="blue", high="red") + ylab("Delay Time in Minutes") + xlab("Flight Disance (in Miles)") + labs(title="Distance vs. Delay Time")
+```
+
+The scatter plot above shows that flights of shorter flights tend to have more severe delays. The distribution of flights that are delayed under 15 minutes are not impacted by flight distance at all. Therefore, distance is only an important variable if we are looking at the occurrence severely delayed flights. 
+
+###Time of day and Delays
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(subset(dep.flights,DEP_DELAY>0 & DEP_DELAY<550),aes(as.integer(DEP_TIME),DEP_DELAY, color = DEP_DELAY)) + geom_jitter(width = 50) + geom_point(alpha = 0.3) + scale_color_gradient(low="blue", high="red") + ylab("Delay Time in Minutes") + xlab("Time of Day") + labs(title="Time of Day vs. Delay Time") + scale_x_continuous(breaks=c(0,600,1200,1800,2400),labels=c("12:00AM", "6:00AM", "12:00PM","6:00PM", "12:00PM"))
+
+```
+
+Time of day seems to indicate a clear pattern. Those Flights between 6AM and noon seem to have much fewer chances of delays than those in the later hours of the day. This makes sense since flights in the morning are less likely to be delayed by waiting for an arriving plane. We predict that time of day will be an important variable when determining if a flight is delayed. 
+
+###Arrival Delay and flight delays
+
+We want to explore if an arrival flight tends to impact the severity of delays.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(subset(fl.joint,DEP_DELAY>0), aes(ARR_DELAY,DEP_DELAY, color = DEP_DELAY)) + geom_point(alpha=0.6)+  scale_color_gradient(low="blue", high="red") + geom_smooth(method = "loess")
+
+```
+
+There does appear to be a relationship between the time a flight takes off and the time the flight before it landed. Longer flight arrivals do see higher flight delays. However there are still many instances where a flight landed early and still took off late. We do predict that this variable will have a determining factor on weather or not a flight is delayed. 
+
+##Variable Selection 
+
+First, we clean the data by dropping repeated observations. Then we create a raw selection dataset including all predictors. While dropping NAs, we drop 1.2% of rows.
+```{r}
+# drop repeated observations
+x = unique(x)
+colnames(x) = gsub(".x","_ARR",colnames(x))
+colnames(x) = gsub(".y","_DEP",colnames(x))
+x = x[,c("ARR_TIME","FL_DATE_ARR","FL_DATE_DEP","transit.time"):=NULL]
+x$MONTH = factor(months(x$FL_DATE))
+x$WEEKDAY = factor(weekdays(x$FL_DATE))
+# create predictors set
+x = x[,.(DEP_DELAY,TMAX,TMIN,PRCP,AWND,MONTH,WEEKDAY,IS_HOLIDAY,DIVERTED_ARR,ARR_DELAY,ORIGIN_STATE_ABR,DISTANCE_ARR,ACTUAL_ELAPSED_TIME,DISTANCE_GROUP_ARR,AIRLINE_DESC_DEP,DEST_STATE_ABR,DISTANCE_DEP,DISTANCE_GROUP_DEP,DATE_TIME_DEP)]
+
+# drop 1.2% of rows while dropping NAs
+x = na.omit(x)
+x$y = cut(x$DEP_DELAY,breaks = c(-Inf,15,45,Inf))
+```
+
+Before splitting into training and testing, we can see that flight time and distance of arrival flights are highly correlated. Therefore, we create a new feature `DIST_TIME_ARR` out of correlated variables flight time/distance of arrival flights feature with PCA. 
+```{r}
+# create arrival flight time/distance feature with PCA
+x$DIST_TIME_ARR = prcomp(cbind(x$DISTANCE_ARR,x$ACTUAL_ELAPSED_TIME),center = TRUE, scale = TRUE)$x[,"PC1"]
+x = x[,c("DISTANCE_ARR","ACTUAL_ELAPSED_TIME"):=NULL]
+
+# create weather temperature feature
+x$TEMP = prcomp(cbind(x$TMIX,x$TMAX),center = TRUE, scale = TRUE)$x[,"PC1"]
+x = x[,c("TMIN","TMAX"):=NULL]
+```
+
+From descriptive analysis, we can see Time of day seems to indicate a clear pattern. Therefore, we also create a feature on time of day.
+```{r}
+x$HOUR_DEP = as.factor(hour(x$DATE_TIME_DEP))
+x = x[,DATE_TIME_DEP:=NULL]
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Next, we start splitting data into training and testing sets. Since our data is not equally weighted across delay categories, we should not do random sampling. In this case, we use caret functionality to do stratified sampling and preserve the allocation across categories. 
+```{r}
+set.seed(12345)
+train_index <- createDataPartition(x$y, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train.x = x[train_index,]
+test.x = x[-train_index,]
+```
+
+In order to run several methods, we need to expand factors into dummies. We would also drop any variable that has no variance.
+
+```{r message=FALSE}
+
+train.matrix = model.matrix(~TEMP+PRCP+AWND+ # weather
+                          MONTH+WEEKDAY+IS_HOLIDAY+ # seasonality
+                          ARR_DELAY+ORIGIN_STATE_ABR+DIST_TIME_ARR+DISTANCE_GROUP_ARR+ # arrival
+                          AIRLINE_DESC_DEP+DEST_STATE_ABR+DISTANCE_DEP+DISTANCE_GROUP_DEP+HOUR_DEP-1, # departure
+                          data=train.x)
+test.matrix = model.matrix(~TEMP+PRCP+AWND+ # weather
+                          MONTH+WEEKDAY+IS_HOLIDAY+ # seasonality
+                          ARR_DELAY+ORIGIN_STATE_ABR+DIST_TIME_ARR+DISTANCE_GROUP_ARR+ # arrival
+                          AIRLINE_DESC_DEP+DEST_STATE_ABR+DISTANCE_DEP+DISTANCE_GROUP_DEP+HOUR_DEP-1, # departure
+                          data=test.x)
+y = train.x$y
+y.test = test.x$y
+train.x = train.x[,colnames(train.x)!='DEP_DELAY',with=FALSE]
+test.x = test.x[,colnames(test.x)!='DEP_DELAY',with=FALSE]
+
+# drop zero variance columns
+drop.zero.var <- function(x) {
+    idx <- apply(x,2,function(x) length(unique(x)))
+    keep <- which(!idx <= 1)
+    unlist(keep)
+}
+keep = drop.zero.var(train.matrix)
+colnames(train.matrix)[-keep]
+train.matrix = train.matrix[,keep]
+test.matrix = test.matrix[,keep]
+```
+
+We use the multinomial LASSO for two purposes. First, as a method for variable selection, then as a model by itself. As a method for variable selection, we selected $\lambda$ corresponding to 1-SE rule.  This would yield a simpler model to use in the LDA. 
+
+It is clear from three coefficient plots that for each of the categories that there is a very important variable for explaining the outcomes and stays this way throughout the variable selection.
+
+```{r cache=TRUE}
+# multinomial lasso 
+lasso.cv = cv.glmnet(x=train.matrix, y=as.vector(train.x$y), type.measure="class", nfold=10, family="multinomial")
+```
+
+```{r}
+plot.cv.glmnet(lasso.cv)
+
+# multinomial regression
+lasso = glmnet(x=train.matrix, y=train.x$y, family="multinomial")
+
+# coefficient trayectory
+plot(lasso)
+
+# variable selection
+coef.lasso = coef(lasso, s=lasso.cv$lambda.min)
+
+# plot tables
+# no delay
+temp = as.data.frame(as.matrix(coef.lasso$`(-Inf,15]`))
+temp = subset(temp, temp$`1`>1e-10)
+colnames(temp) <- 'Coefficients'
+var.names = rownames(temp)
+kable(temp,digits=2)
+# delay
+temp = as.data.frame(as.matrix(coef.lasso$`(15,45]`))
+temp = subset(temp, temp$`1`>0)
+colnames(temp) <- 'Coefficients'
+var.names = c(var.names,rownames(temp))
+kable(temp,digits=2)
+# severe delay
+temp = as.data.frame(as.matrix(coef.lasso$`(45, Inf]`))
+temp = subset(temp, temp$`1`>0)
+colnames(temp) <- 'Coefficients'
+var.names = c(var.names,rownames(temp))
+var.names = unique(var.names)
+names(var.names) = "Variables"
+var.names = var.names[var.names!="(Intercept)"]
+kable(temp,digits=2)
+```
+
+We have selected 66 variables by LASSO. Among these, the model selected some of weather, seasonality, departure and arrival variables. For example, wind speed is one of the selected weather variables probably because wind affects taking off and landing a lot. Departure hours are selected probably because morning flights are less likely to be delayed by waiting for an arriving plane. LASSO selects almost half of the months probably because of increased air traffic. Some flights origins and destinations are selected as location affects delay a lot. Also, different airlines of departure flights are selected because there is a clear relationship between airlines and delay. To sum up, weather, seasonality, departure and arrival variables all matters in our model.
+```{r}
+kable(data.frame(var.names), digits=2)
+```
+
+## Model for Delayed Flights
+This section focuses on modelling flight delays based on four techniques: 1) Multinomial LASSO, 2) LDA fit on LASSO variables (we will call it LASSO-LDA) and LDA fit on all variables, 3) Random Forest, and 4) Boosted Trees.
+
+### Multinomial LASSO
+As we discussed earlier, the LASSO can be used for both selecting features and prediction. As a regularized version of the Multinomial Logistic Regression, the multinomial LASSO fits three submodels: one for every delay category. The following is the confusion matrix as output from the model.  
+```{r}
+lasso.pred = predict(lasso, s=lasso.cv$lambda.1se, type="class", newx=test.matrix)
+table(prediction=as.factor(lasso.pred),observed=y.test)
+```
+
+### LASSO-LDA
+The LASSO-LDA consists of preselecting the variables and then running a Linear Discriminant Analysis on top of these variables. This approach allows us to remove noisy variables before estimating the joint normal distribution of the predictors. However, we may be losing variables that are not important by themselves but in interactions with other variables.
+
+Note that we are using variables selected by LASSO on training data, and then estimating the LDA regression on training data as well. Hence, the accuracy of the model over the validation set is still a valid inference.
+```{r}
+train.subset = data.table(train.matrix)
+train.subset = train.subset[,var.names,with=FALSE]
+test.subset = data.table(test.matrix)
+test.subset = test.subset[,var.names,with=FALSE]
+
+# fit LDA
+lda.lasso.fit = lda(y~.,data=train.subset)
+lda.lasso.pred = predict(lda.lasso.fit, newdata=test.subset)
+# plot results
+table(prediction=lda.lasso.pred$class,observed=y.test)
+```
+### Full-set LDA
+To test if significant interactions between non-selected variables could be present, we run an LDA on all the variables we selected. From running this model and evaluating the confusion matrices we can see that there are in fact useful variables not selected by LASSO.
+```{r warning= FALSE}
+train.matrix = as.data.frame(train.matrix)
+test.matrix = as.data.frame(test.matrix)
+
+# fit LDA
+lda.fit = lda(y~.,data=train.matrix)
+lda.pred = predict(lda.fit, newdata=test.matrix)
+# plot results
+table(prediction=lda.pred$class,observed=y.test)
+```
+
+### Random Forest
+Since we found interactions are useful, we decided to also try running a Random Forest over all data. The results are better than all previous models, as can be seen from the confusion table below. It is also note worthy that the most important variable is `ARR_DELAY`, or the minutes of delay of the arrival flight.
+```{r cache=TRUE}
+rf.fit = randomForest(y=y, x=train.matrix, ntree=2000)
+rf.pred = predict(rf.fit, newdata=test.matrix, type='response')
+varImpPlot(rf.fit)
+table(prediction=rf.pred,observed=y.test)
+```
+
+### Boosted Trees
+In a further effort to model interactions in data, we chose to try a boosted trees model with 0.02 shrinkage. Even though we risk overfitting, the model chooses the number of trees that minimize the cross-validation error. Further, its performance in the following tables reassures us that this is not the case.
+```{r cache=TRUE}
+gb.fit.cv = gbm(y ~ ., n.trees=3000, data=train.matrix, distribution="multinomial", cv.folds=5, interaction.depth=1, verbose=FALSE, shrinkage=0.02, n.cores=3)
+plot(gb.fit.cv$cv.error)
+# best trees
+which.min(gb.fit.cv$cv.error)
+
+gb.pred = predict(gb.fit.cv, newdata=test.matrix, type='response', n.trees=which.min(gb.fit.cv$cv.error), shrinkage=0.02)
+gb.pred = apply(gb.pred,1,function(x) levels(y)[which.max(x)])
+table(prediction=gb.pred,observed=y.test)
+```
+
+The number above points to the CV-error minimizing number of trees, and the table below that to the confusion matrix.
+
+## Selecting a Model
+### Confusion Matrices
+For easy analysis, we present the confusion matrices for every model close to each other. We can see that Random Forest is close to strictly dominating the other models for all classes.
+
+From the confusion matrix of Multinomial LASSO, we can see that 99% of flights which are not delayed are classified correctly. For flights with delay time between 15-45 minutes, Multinomial LASSO doesn't perform very well as it misclassifies around 92% of delays to not delayed. For flights with delay time more than 45 minutes, less than 60% are classified correctly.
+
+LASSO Multinomial
+```{r}
+# LASSO Multinomial
+table(prediction=as.factor(lasso.pred),observed=y.test)
+```
+
+From the confusion matrix of LDA-LASSO, we can see that 99% of flights which are not delayed are classified correctly. Similar to Multinomial LASSO, for flights with delay time between 15-45 minutes, LDA-LASSO doesn't perform very well as it misclassifies around 87% of delays to not delayed. For flights with delay time more than 45 minutes, around 60% of them are successfully predicted.
+
+LDA - LASSO
+```{r}
+# LDA - LASSO
+table(prediction=lda.lasso.pred$class,observed=y.test)
+```
+
+From the confusion matrix of Full-set LDA, we can see that 98% of flights which are not delayed are classified correctly. For flights with delay time between 15-45 minutes, 85% of them are misclassified to not delayed. For flights with delay time more than 45 minutes, the model doesn't perform very well as less than 60% are classified correctly.
+
+LDA
+```{r}
+# LDA
+table(prediction=lda.pred$class,observed=y.test)
+```
+
+From the confusion matrix of Random Forest, we can see that the model performs perfectly for flights which are not delayed with more than 99% of the data correctly classified. For flights with delay time between 15-45 minutes, the model isn't doing very well as it only correctly predicted about 45% of the data with a lot of misclassifications to "not delayed". However, different from previous models, Random Forest successfully predicted around 70% of the data for flights with delay time more than 45 minutes.
+
+Random Forest
+```{r}
+# Random Forest
+table(prediction=rf.pred,observed=y.test)
+```
+
+From the confusion matrix of Boosted Trees, we can see that the model is doing a good job for flights which are not delayed with around 98% of the data correctly classified. Similar to Random Forest, Boosted Trees predicts poorly for flights with delay time between 15-45 minutes but predicts well for for flights with delay time more than 45 minutes.
+
+Boosted Trees
+```{r}
+# Boosted Trees
+table(prediction=gb.pred,observed=y.test)
+```
+## Accuracy and consumer prediction preferences
+
+This matrix gives shows the cost associated with the outcomes of each category of flight delays. 
+For example, all the diagonals assign positive scores for true detection of all the positives.
+We assume that the model focusses on identifying severely delayed flights more. This is because we assume customers are more affected if their flight is delayed by more than 45 minutes. Therefore, we have assigned a positive 5 points if we accurately detect a severely delayed flight. In similar pattern, we have assigned positive points to accurately detected moderately delayed flights (between 15 mins - 45 mins). We call an under-15 minutes delay as "almost no delay" as it doesn't affect the customer a lot. 
+Similarly, if we classify a severely delayed flight as "almost no delay" or vice versa, it is highly undesirable. 
+Therefore, we have assigned negative 5 points for that. 
+In similar fashion, we have assigned points to other classification results. 
+
+```{r}
+preference.matrix = data.frame(list(`(-Inf,15]` = c(1,0,-5),`(15,45]` = c(0,3,-3),`(45, Inf]` = c(-5,-3,5)))
+colnames(preference.matrix) <- c("(-Inf,15]", "(15,45]","(45, Inf]")
+rownames(preference.matrix) <- c("(-Inf,15]", "(15,45]","(45, Inf]")
+kable(preference.matrix)
+```
+
+According to the consumer preferences, we a calculated the score of each model. We also calculated the accuracy of every model. We can see from the tables that LASSO, LASSO-LDA and LDA have similar consumer preference scores and accuracy. However, trees seem to perform specially well in this case. Both Random Forest and Boosted Trees have the same accuracy, but according to the consumer preference, Random Forest is our top performer and model choice.
+```{r}
+model.preference = data.frame(Model=NA, Preference=NA, Accuracy=NA)
+
+# LASSO Multinomial
+conf = table(prediction=as.factor(lasso.pred),observed=y.test)
+model.preference[1,1] = "LASSO Multinomial"
+model.preference[1,2] = sum(conf*preference.matrix)
+model.preference[1,3] = sum(diag(conf))/sum(conf)
+# LDA - LASSO
+conf = table(prediction=lda.lasso.pred$class,observed=y.test)
+model.preference[2,1] = "LDA - LASSO"
+model.preference[2,2] = sum(conf*preference.matrix)
+model.preference[2,3] = sum(diag(conf))/sum(conf)
+# LDA
+conf = table(prediction=lda.pred$class,observed=y.test)
+model.preference[3,1] = "LDA"
+model.preference[3,2] = sum(conf*preference.matrix)
+model.preference[3,3] = sum(diag(conf))/sum(conf)
+# Random Forest
+conf = table(prediction=rf.pred,observed=y.test)
+model.preference[4,1] = "Random Forest"
+model.preference[4,2] = sum(conf*preference.matrix)
+model.preference[4,3] = sum(diag(conf))/sum(conf)
+# Boosted Trees
+conf = table(prediction=gb.pred,observed=y.test)
+model.preference[5,1] = "Boosted Trees"
+model.preference[5,2] = sum(conf*preference.matrix)
+model.preference[5,3] = sum(diag(conf))/sum(conf)
+
+kable(model.preference, digits=2)
+```
+
+
+##External Validity
+
+We think the model has a good external validity. After running all our models on the 2006 data for departing flights at PIT airport. We found that the accuracy for this model is 93%. This is still a fairly good classification rate and it may indicate that airport operations have not changed much on factors that are controlled by the model. For example, even though airlines that caused more delays have changed, the model is able to adapt to it and give a fairly similar accuracy. while it is not at the same accuracy of our 2017 data set it does show external validity. The reason for this decrease is that the data from 2006 varies from 2017. This could introduce noise into the data. As opposed to data from 2017, we did not have a list of airport IDs for Pittsburgh. So, we had to join on city and state, running into the risk of also merging other local airports. 
+
+There are also some differences in the data that are coincidental. For example the weather patterns may have been different so how weather impacts delays could have changed. In addition, most of the most influential factors had to do with aircraft were associated with increased air traffic. Since air traffic has increased since 2006 the impact of time of day and if an arrival flight is late could differ between the two time periods. 
+
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+##Cleaning the 2006 Data
+
+flights.2006 <- select (all.PIT.2006,- Flights)
+
+flights.2006$is.delay <- ifelse(flights.2006$DepDelay>0,1,0)
+
+#merge with day of week
+flights.2006 <- left_join(flights.2006 , weekdays, by = c("DayOfWeek"= "Code")) 
+
+
+#merging the 2006 holiday data with flights.2006 data
+flights.2006$FlightDate <- strptime(as.character(flights.2006$FlightDate), "%m/%d/%Y")
+flights.2006$FlightDate <- as.Date(flights.2006$FlightDate, format = "%Y-%m-%d")
+flights.2006 <- left_join(flights.2006, hols.2006, by = c("FlightDate"="date"))
+
+#rename column
+colnames(flights.2006)[colnames(flights.2006)=="holiday_name"] <- "IS_HOLIDAY"
+flights.2006$IS_HOLIDAY <- ifelse(is.na(flights.2006$IS_HOLIDAY),0,1)
+
+#merging the 2016-17 weather data with 2016-17 flights.2006 data
+flights.2006 <- left_join(flights.2006, weather.2006, by = c("FlightDate"="DATE"))
+
+#merging the carrier description with carrier code
+flights.2006 <- left_join(flights.2006, carrier, by = c("AirlineID"="Code"))
+
+#remove unncessary columns
+flights.2006 <- select(flights.2006, -NAME,-DayOfWeek, -index)
+
+
+
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+#2006 Data cleaning
+#preparing the arrivals table
+arr.flights.2006 <- filter(flights.2006,flights.2006$DestCityName == "Pittsburgh" & flights.2006$Dest == "PIT" & flights.2006$DestState == "PA")
+arr.flights.2006 <- select(arr.flights.2006,Origin, OriginState,TailNum,FlightDate,ArrDelay,ArrTime,Distance, DistanceGroup,Diverted,AIRLINE_DESC,ActualElapsedTime)
+arr.flights.2006$IF_DELAY <- ifelse(arr.flights.2006$ArrDelay>15, 1,0)
+
+#preparing the departure flights table
+dep.flights.2006 <- filter(flights.2006,flights.2006$OriginCityName == "Pittsburgh" & flights.2006$Origin == "PIT" & flights.2006$OriginState == "PA")
+dep.flights.2006 <- select(dep.flights.2006,Dest, DestState,TailNum,Month,FlightDate,DepDelay,DepTime,Distance, DistanceGroup,Diverted,AWND,PRCP,TMAX,TMIN,IS_HOLIDAY,AIRLINE_DESC,Quarter, AirlineID,DestCityName,Cancelled)
+dep.flights.2006$IF_DELAY <- ifelse(dep.flights.2006$DepDelay>15, 1,0)
+
+#working with arrivals time
+arr.flights.2006$ArrTime <- as.character(arr.flights.2006$ArrTime)
+arr.flights.2006$ArrTime <- str_pad(arr.flights.2006$ArrTime, width = 4, side = "left", pad = "0")
+arr.flights.2006$ArrTime_STAMP <- paste(substr(arr.flights.2006$ArrTime, start = 1, stop = 2),  substr(arr.flights.2006$ArrTime, start = 3, stop = 4), sep=":")
+arr.flights.2006$ArrTime_STAMP <- paste(arr.flights.2006$ArrTime_STAMP, "00", sep=":")
+arr.flights.2006$DATE_TIME <- paste (arr.flights.2006$FlightDate, arr.flights.2006$ArrTime_STAMP, sep=" ")
+arr.flights.2006$DATE_TIME <- ymd_hms(arr.flights.2006$DATE_TIME,tz=Sys.timezone())
+
+#working with departure time
+dep.flights.2006$DepTime <- as.character(dep.flights.2006$DepTime)
+dep.flights.2006$DepTime <- str_pad(dep.flights.2006$DepTime, width = 4, side = "left", pad = "0")
+dep.flights.2006$DepTime_STAMP <- paste(substr(dep.flights.2006$DepTime, start = 1, stop = 2),  substr(dep.flights.2006$DepTime, start = 3, stop = 4), sep=":")
+dep.flights.2006$DepTime_STAMP <- paste(dep.flights.2006$DepTime_STAMP, "00", sep=":")
+dep.flights.2006$DATE_TIME <- paste(dep.flights.2006$FlightDate, dep.flights.2006$DepTime_STAMP, sep=" ")
+dep.flights.2006$DATE_TIME <- ymd_hms(dep.flights.2006$DATE_TIME,tz=Sys.timezone())
+```
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+	#if same arrival and departure date are same
+    fl.a<- inner_join(arr.flights.2006, dep.flights.2006, by = c ("TailNum", "FlightDate"))
+      fl.count.1.2006 <- nrow(inner_join(arr.flights.2006, dep.flights.2006, by = c ("TailNum", "FlightDate")))
+      
+   #if flight and departure date are not same
+
+      #first join all the same planes
+      fl.count.2006 <- inner_join(arr.flights.2006, dep.flights.2006, by = c ("TailNum"))
+      
+      #remove the planes flying on the same date (as we have already covered that)
+      fl.count.2006 <- filter(fl.count.2006, fl.count.2006$FlightDate.x!=fl.count.2006$FlightDate.y)
+      
+      #calculate the difference in departure and arrival date times
+      fl.count.2006$transit.time <- difftime(fl.count.2006$DATE_TIME.y,fl.count.2006$DATE_TIME.x,unit="hours")
+      
+      #round the difference in hours
+      fl.count.2006$transit.time <- round(fl.count.2006$transit.time)
+      
+      #get those flights whose transit time is within 12 hours
+      fl.count.2006$FlightDate = fl.count.2006$FlightDate.y # not the cleanest way
+      fl.count.2006 <- filter(fl.count.2006,fl.count.2006$transit.time<12 & fl.count.2006$transit.time>0)
+      fl.count.2.2006 <- nrow(unique(fl.count.2006))
+      #nrow(fl.count.2.2006)
+      #fl.count.2.2006
+      #unique(fl.count.2006$transit.time)
+  
+      #total planes which travel on the same date or travel have a time difference of 24 hours
+      #fl.count.2.2006+fl.count.1.2006
+      #(fl.count.2.2006+fl.count.1.2006)/nrow(dep.flights.2006)
+      
+      # create analysis dataframe
+      x = rbindlist(list(as.data.table(right_join(arr.flights.2006, dep.flights.2006, by = c ("TailNum", "FlightDate"))), as.data.table(fl.count.2006)), fill=TRUE)
+```
+
+##Descriptive Analysis 2006
+
+This report looks to predict if a flight will be delayed and if so, to what extent. Thus, it is important to first look at descriptive statistics on the flight delays themselves to guide our hypothesis.Aproximatly `r (nrow(subset(dep.flights.2006, DepDelay>0))/nrow(dep.flights.2006))*100`% of these flights were delayed by any amount.
+
+###Flight Delays
+First, we wiil look at the distribution of delays:
+
+```{r}
+ggplot(subset(fl.count.2006, DepDelay < 550), aes(DepDelay)) + geom_density(fill = "Dark blue", alpha = 0.6) +  geom_vline(data=all.flights, xintercept = 15, color = "black") + geom_text(aes(x=25, label="Delay more than 15 minutes"),y=0.06, colour="black", angle=90) + xlab("Flight Delay Time (in minutes)") + ylab("Density") + labs(title="Distribution of Delay Times")
+
+```
+This confrims that of all flights that are delayed, that most of them are under 15 minutes. Then less than that is between 15 and 45 minutes. Lastly, very few includes delays of 45 minutes or greater.
+
+###Seasonality and delays
+
+Addressing seasonality we will look at delays broken down by months. Below see a scatter plot that shows a scatter plot of months and length of delays. 
+
+```{r }
+proportion.delay <- dep.flights.2006 %>%
+  filter(!is.na(IF_DELAY)) %>%
+  group_by(Quarter,IF_DELAY) %>%
+  tally()
+
+ggplot(proportion.delay, aes(Quarter, n ,fill = as.factor(IF_DELAY))) + geom_bar(stat="identity") + scale_fill_discrete(name="Delays", labels=c("Not Delayed","Delayed"))+ ylab("Count") + xlab("Quarter") + labs(title="Number of Flights per Quarter")
+
+```
+
+```{r}
+ggplot(subset(dep.flights.2006, DepDelay > 15 & DepDelay < 550),aes(Quarter, DepDelay, color = as.factor(Quarter))) + geom_point(alpha = 0.3) + geom_jitter() + geom_smooth(method = "lm", formula = y ~ cut(x, breaks = c(-Inf,1,2,3,4,5,6,7,8,9,10,11,12, Inf)), lwd = 1.25, color = "white") + xlab("Quarter") + ylab("Flight Delay Time (in minutes)") + labs(title="Scatter plot of Severe Delay times and Month") + scale_color_discrete(name="Quarter", labels=c("Winter","Spring", "Summer", "Fall"))
+```
+There does not not appear to be any major trends identified when looking at seasonal trends. Delays seem to increase in frequency and severity during the spring and the holidays. This could be because of increased air traffic or weather. This is in sync with observations from 2016 data.
+
+###Airline Carriers and Delays
+
+```{r }
+
+carrier.group <- dep.flights.2006 %>%
+  filter(DepDelay >0)%>%
+  group_by(AIRLINE_DESC)%>%
+  summarize(delay.mean = mean(DepDelay), sd.delay = sd(DepDelay), count = n())%>%
+  arrange(desc(delay.mean))
+
+pie(carrier.group$count, labels = carrier.group$AIRLINE_DESC, main="Airline Breakdown", cex=0.7)
+
+kable(carrier.group[,c(1,2,3)], col.names = c("Airline", "Mean Delay Time","Standard Deviation Delay Time"))
+```
+
+It seems that US Airways is the most popular airline at the PIT airport, followed by Southwest Airlines. Also the most delayed flights tend to be from Express Jet, United. This result is different from 2016 data.
+
+###Distance of flight and delays
+
+We would like to investigate if the distance of the flight has any relationship with the possibility and severity of delays. First, looking at the distribution of flight distancs:
+
+```{r }
+ggplot(subset(dep.flights.2006, DepDelay >0 & DepDelay <550),aes(Distance, DepDelay, color = DepDelay)) + geom_jitter(width = 50) + geom_point(alpha = 0.3) + scale_color_gradient(low="blue", high="red") + ylab("Delay Time in Minutes") + xlab("Flight Disance (in Miles)") + labs(title="Distance vs. Delay Time")
+```
+The scatter plot above shows that flights of relatively shorter flights tend to have more severe delays.
+
+###Time of day and Delays
+
+```{r }
+ggplot(subset(dep.flights.2006, DepDelay >0 & DepDelay <550),aes(as.integer(DepTime), DepDelay, color = DepDelay)) + geom_jitter(width = 50) + geom_point(alpha = 0.3) + scale_color_gradient(low="blue", high="red") + ylab("Delay Time in Minutes") + xlab("Time of Day") + labs(title="Time of Day vs. Delay Time") + scale_x_continuous(breaks=c(0,600,1200,1800,2400),labels=c("12:00AM", "6:00AM", "12:00PM","6:00PM", "12:00PM"))
+
+```
+Time of day seems to indicate a clear pattern. Results are similar to 2016 observed data. Those Flights between 6AM and noon seem to have much fewer chances of delays than those in the later hours of the day.
+
+###Arrival Delay and flight delays
+
+We want to explore if an arrival flight tends to impact the sevarity of delays.
+
+```{r }
+ggplot(subset(fl.count.2006, DepDelay >0), aes(ArrDelay, DepDelay, color = DepDelay)) + geom_point(alpha=0.6)+  scale_color_gradient(low="blue", high="red") + geom_smooth(method = "loess")
+
+```
+There does appear to be a relationship between the time a fligt takes off and the time the flight before it landed. The results are similar to 2016 data.
+
+Cleaning data and creating raw selection data set
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# drop repeated observations
+x = unique(x)
+colnames(x) = gsub(".x","_ARR",colnames(x))
+colnames(x) = gsub("\\.y","_DEP",colnames(x))
+x = x[,c("ARR_TIME","FlightDate_ARR","FlightDate_DEP","transit.time"):=NULL]
+x$MONTH = factor(months(x$FlightDate))
+x$WEEKDAY = factor(weekdays(x$FlightDate))
+# create predictors set
+x = x[,.(DepDelay,TMAX,TMIN,PRCP,AWND,MONTH,WEEKDAY,IS_HOLIDAY,Diverted_ARR,ArrDelay,OriginState,Distance_ARR,ActualElapsedTime,DistanceGroup_ARR,AIRLINE_DESC_DEP,DestState,Distance_DEP,DistanceGroup_DEP,DATE_TIME_DEP)]
+
+# drop 1.2% of rows while dropping NAs
+x = na.omit(x)
+x$y = cut(x$DepDelay,breaks = c(-Inf,15,45,Inf))
+```
+
+Before splitting into training and testing, create a feature out of correlated variables flight time/distance of arrival flights feature with PCA
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# create arrival flight time/distance feature with PCA
+x$DIST_TIME_ARR = prcomp(cbind(x$Distance_ARR,x$ActualElapsedTime),center = TRUE, scale = TRUE)$x[,"PC1"]
+x = x[,c("Distance_ARR","ActualElapsedTime"):=NULL]
+
+# create weather temperature feature
+x$TEMP = prcomp(cbind(x$TMIN,x$TMAX),center = TRUE, scale = TRUE)$x[,"PC1"]
+x = x[,c("TMIN","TMAX"):=NULL]
+```
+
+Also, create a feature on time of day
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+x$HOUR_DEP = as.factor(hour(x$DATE_TIME_DEP))
+x = x[,DATE_TIME_DEP:=NULL]
+```
+
+Split data into training and testing sets
+From caret manual: If the y argument to this function is a factor, the random sampling occurs within each class and should preserve the overall class distribution of the data.
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+set.seed(12345)
+train_index <- createDataPartition(x$y, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train.x = x[train_index,]
+test.x = x[-train_index,]
+```
+
+Create training matrix (factor expansion)
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+
+train.matrix = model.matrix(~TEMP+PRCP+AWND+ # weather
+                          MONTH+WEEKDAY+IS_HOLIDAY+ # seasonality
+                          ArrDelay+OriginState+DIST_TIME_ARR+DistanceGroup_ARR+ # arrival
+                          AIRLINE_DESC_DEP+DestState+Distance_DEP+DistanceGroup_DEP+HOUR_DEP-1, # departure
+                          data=train.x)
+test.matrix = model.matrix(~TEMP+PRCP+AWND+ # weather
+                          MONTH+WEEKDAY+IS_HOLIDAY+ # seasonality
+                          ArrDelay+OriginState+DIST_TIME_ARR+DistanceGroup_ARR+ # arrival
+                          AIRLINE_DESC_DEP+DestState+Distance_DEP+DistanceGroup_DEP+HOUR_DEP-1, # departure
+                          data=test.x)
+y = train.x$y
+y.test = test.x$y
+train.x = train.x[,colnames(train.x)!='DepDelay',with=FALSE]
+test.x = test.x[,colnames(test.x)!='DepDelay',with=FALSE]
+
+# drop zero variance columns
+drop.zero.var <- function(x) {
+    idx <- apply(x,2,function(x) length(unique(x)))
+    keep <- which(!idx <= 1)
+    unlist(keep)
+}
+keep = drop.zero.var(train.matrix)
+train.matrix = train.matrix[,keep]
+test.matrix = test.matrix[,keep]
+```
+
+Variable selection using multinomial LASSO
+check with less classes (merge 2)
+track time of day
+
+```{r cache=TRUE}
+# multinomial lasso
+lasso.cv = cv.glmnet(x=train.matrix, y=train.x$y, type.measure="class", nfold=10, family="multinomial")
+```
+
+```{r}
+plot.cv.glmnet(lasso.cv)
+
+# multinomial regression
+lasso = glmnet(x=train.matrix, y=train.x$y, family="multinomial")
+
+# coefficient trayectory
+plot(lasso)
+
+# variable selection
+coef.lasso = coef(lasso, s=lasso.cv$lambda.min)
+
+# plot tables
+# no delay
+temp = as.data.frame(as.matrix(coef.lasso$`(-Inf,15]`))
+temp = subset(temp, temp$`1`>1e-10)
+colnames(temp) <- 'Coefficients'
+var.names = rownames(temp)
+kable(temp,digits=2)
+# delay
+temp = as.data.frame(as.matrix(coef.lasso$`(15,45]`))
+temp = subset(temp, temp$`1`>0)
+colnames(temp) <- 'Coefficients'
+var.names = c(var.names,rownames(temp))
+kable(temp,digits=2)
+# severe delay
+temp = as.data.frame(as.matrix(coef.lasso$`(45, Inf]`))
+temp = subset(temp, temp$`1`>0)
+colnames(temp) <- 'Coefficients'
+var.names = c(var.names,rownames(temp))
+var.names = unique(var.names)
+var.names = var.names[var.names!="(Intercept)"]
+names(var.names) = "Variables"
+kable(temp,digits=2)
+lasso.pred = predict(lasso, s=lasso.cv$lambda.1se, type="class", newx=test.matrix)
+table(prediction=as.factor(lasso.pred),observed=y.test)
+```
+The variables selected by LASSO are:
+```{r}
+kable(data.frame(var.names), digits=2)
+```
+
+##Model for Delayed Flights 2006
+
+###LDA
+
+Fit an LDA on selected variables by LASSO
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+train.subset = data.table(train.matrix)
+train.subset = train.subset[,var.names,with=FALSE]
+test.subset = data.table(test.matrix)
+test.subset = test.subset[,var.names,with=FALSE]
+
+# fit LDA
+lda.lasso.fit = lda(y~.,data=train.subset)
+lda.lasso.pred = predict(lda.lasso.fit, newdata=test.subset)
+# plot results
+table(prediction=lda.lasso.pred$class,observed=y.test)
+# plot distribution over Linear Discriminants
+# plot(lda.fit, col=as.numeric(train.subset$y))
+```
+All-variables LDA
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+train.matrix = as.data.frame(train.matrix)
+test.matrix = as.data.frame(test.matrix)
+
+# fit LDA
+lda.fit = lda(y~.,data=train.matrix)
+lda.pred = predict(lda.fit, newdata=test.matrix)
+# plot results
+table(prediction=lda.pred$class,observed=y.test)
+# plot distribution over Linear Discriminants
+# plot(lda.fit, col=as.numeric(train.subset$y))
+```
+
+###Random Forest
+```{r cache=TRUE}
+rf.fit = randomForest(y=y, x=train.matrix, ntree=2000)
+rf.pred = predict(rf.fit, newdata=test.matrix, type='response')
+# varImpPlot(rf.fit)
+table(prediction=rf.pred,observed=y.test)
+```
+
+###Boosted Trees
+```{r cache=TRUE}
+gb.fit.cv = gbm(y ~ ., n.trees=3000, data=train.matrix, distribution="multinomial", cv.folds=5, interaction.depth=1, verbose=FALSE, shrinkage=0.02, n.cores=3)
+plot(gb.fit.cv$cv.error)
+# best trees
+which.min(gb.fit.cv$cv.error)
+
+gb.pred = predict(gb.fit.cv, newdata=test.matrix, type='response', n.trees=which.min(gb.fit.cv$cv.error), shrinkage=0.02)
+gb.pred = apply(gb.pred,1,function(x) levels(y)[which.max(x)])
+table(prediction=gb.pred,observed=y.test)
+```
+
+The number above points to the CV-error minimizing number of trees, and the table below that to the confusion matrix.
+
+###Model Comparison
+Wrapping up: Model Comparison
+
+LASSO Multinomial
+```{r}
+# LASSO Multinomial
+table(prediction=as.factor(lasso.pred),observed=y.test)
+```
+
+LDA - LASSO
+```{r}
+# LDA - LASSO
+table(prediction=lda.lasso.pred$class,observed=y.test)
+```
+
+LDA
+```{r}
+# LDA
+table(prediction=lda.pred$class,observed=y.test)
+```
+
+Random Forest
+```{r}
+# Random Forest
+table(prediction=rf.pred,observed=y.test)
+```
+
+Boosted Trees
+```{r}
+# Boosted Trees
+table(prediction=gb.pred,observed=y.test)
+```
+## Select a model 2006
+
+The preferences matrix is the same as that set up for the 2016 data analysis.
+
+```{r}
+preference.matrix = data.frame(list(`(-Inf,15]` = c(1,0,-5),`(15,45]` = c(0,3,-3),`(45, Inf]` = c(-5,-3,5)))
+```
+
+The following table describes the user preference score and accuracy for the models over the 2006 data.
+
+```{r}
+model.preference = data.frame(Model=NA, Preference=NA, Accuracy=NA)
+
+# LASSO Multinomial
+conf = table(prediction=as.factor(lasso.pred),observed=y.test)
+model.preference[1,1] = "LASSO Multinomial"
+model.preference[1,2] = sum(conf*preference.matrix)
+model.preference[1,3] = sum(diag(conf))/sum(conf)
+# LDA - LASSO
+conf = table(prediction=lda.lasso.pred$class,observed=y.test)
+model.preference[2,1] = "LDA - LASSO"
+model.preference[2,2] = sum(conf*preference.matrix)
+model.preference[2,3] = sum(diag(conf))/sum(conf)
+# LDA
+conf = table(prediction=lda.pred$class,observed=y.test)
+model.preference[3,1] = "LDA"
+model.preference[3,2] = sum(conf*preference.matrix)
+model.preference[3,3] = sum(diag(conf))/sum(conf)
+# Random Forest
+conf = table(prediction=rf.pred,observed=y.test)
+model.preference[4,1] = "Random Forest"
+model.preference[4,2] = sum(conf*preference.matrix)
+model.preference[4,3] = sum(diag(conf))/sum(conf)
+# Boosted Trees
+conf = table(prediction=gb.pred,observed=y.test)
+model.preference[5,1] = "Boosted Trees"
+model.preference[5,2] = sum(conf*preference.matrix)
+model.preference[5,3] = sum(diag(conf))/sum(conf)
+
+kable(model.preference, digits=2)
+```
+
+## Discussion 
+
+After running many different models we found that the most accurate model came from our Random Forest model. In this case we were able to find the lowest misclassification rate on our test data and had the best results when computed with our cost matrix. Looking at the ROC curves in the previous section you can see that the model does a moderate job at predicting if a flight will not be delayed (0 to 15 minutes), or will be slightly delayed (15 to 45 minutes). Our best results were for classifying a flight as severely delayed (more than 45 minutes). While boosted trees does not have the easiest interpretation, we can see which variables made the largest impact in our data.
+
+One of the most important variables in our model was a variable indicating if a flight arrived late. This finding was supported in our descriptive analysis where we looked at the reasons why flights were delayed. A majority of flights are delayed due to carrier delay or late arrival. This would explain why this variable would have such a large impact on our model. Since the strongest part of our model was predicting severe delays, we could speculate that a late arrival is what is most likely to cause delays of 45 minutes or longer. This result makes logical sense and is an impactful variable in our model.
+
+Another strong variable was time of day which recorded the time that a flight actually took off. We found that flights that take off later in the day tend to be more delayed. This makes sense given that the other important variable is if a flight arrived late. Since flights early in the morning do not have to wait on an incoming flight, they are less likely to be late. As the day goes on the likelihood of a previous flight being delayed gets higher and higher. We can also see a trend in the descriptive analytics. The flights do not see serious delays until after noon and they begin to increase. This could be due to increased air traffic or the snowball effect of arrival plane delays as discussed previously. Time of day is an important variable in our analysis and helps us make better predictions for flight delays. 
+
+The next impactful data variables have to do with the temperature. Temperature is measured both by the daily maximum and minimum. This variable was not surprising since weather can impact if a flight takes off on time. While weather was not a popular reason for delay times in our descriptive analysis, it is a common notion that flights cannot fly or take longer routes during severe weather. We did see some fluctuation in flight delays when looking at seasonality, maybe further exploration could yield more insightful results on the relationship between temperature and flight delays. 
+
+To make the model better, we could explore adding more information on presidential or important politician flights, since they disrupt air traffic. This agenda is probably available online. We could also think of adding news analysis information. For example, major disruptions, such as volcanic eruptions or terrorist threats produce major delays in flights. This information could be obtained from some of it is available in the National Aviation System (NAS), or from rather sophisticated news analysis.
+
+We are happy with our model and ability to predict flight delays coming out of the Pittsburgh airport. We do, however, have some concerns about implementing such an application into our application. Since the most impactful variables are if the arrival plane is late and the weather we are concerned that our model will not be effective until this data is captured for a customer's flight. This might not occur until a few hours before take off, thus lessening the benefit of this delay alert feature. As a solution, we could build an application that would chain predictions until we can predict the flight of interest. In the upside, we do still have several important variables in our important categoires of seasonality, weather, departure informatio and many arrival details that we will know ahead of time. In future iterations, we could anlyze the impact of chaining forecasts to predict flight delays well in advance.
+
+## References
+
+We obtained data for the analysis on weather from NCDC in their https://www.ncdc.noaa.gov/ website and flight information from BTS https://www.transtats.bts.gov/ website.
